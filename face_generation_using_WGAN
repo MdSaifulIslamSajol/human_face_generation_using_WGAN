@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Oct 16 22:36:21 2022
+
+@author: saiful
+"""
+#%%
+# This Python 3 environment comes with many helpful analytics libraries installed
+# It is defined by the kaggle/python Docker image: https://github.com/kaggle/docker-python
+# For example, here's several helpful packages to load
+
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+
+# Input data files are available in the read-only "../input/" directory
+# For example, running this (by clicking run or pressing Shift+Enter) will list all files under the input directory
+
+import os
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+
+# You can write up to 20GB to the current directory (/kaggle/working/) that gets preserved as output when you create a version using "Save & Run All" 
+# You can also write temporary files to /kaggle/temp/, but they won't be saved outside of the current session
+#%% Setting file location
+File_location = "../face generation/"
+
+#%% Loading useful libraries
+# Importing librabries
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader 
+import torchvision
+import torchvision.datasets as datasets                   
+import torchvision.transforms as transforms
+from torch.utils.tensorboard import SummaryWriter
+import numpy as np 
+import pandas as pd 
+import matplotlib.pyplot as plt
+# Setting up device
+device = torch.device('cuda:6' if torch.cuda.is_available() else 'cpu')
+#%% Setting up GPU as device
+# Setting Hyperparameters
+num_train_samples= 2000
+learning_rate = 5e-5
+batch_size = 128
+image_size = 64
+channel_img = 3
+z_dim = 100
+num_epochs = 100
+feature_d = 64
+feature_g = 64
+critic_iterations = 5
+lambda_GP = 10
+
+variable = transforms.Compose(
+    [
+        transforms.Resize((image_size,image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+        [0.5 for _ in range(channel_img)], [0.5 for _ in range(channel_img)]
+        ),
+    ]
+)
+#%%
+# Loading Dataset 
+dataset = datasets.ImageFolder(root = File_location, transform = variable)
+print("Lenght of total dataset:", len(dataset))
+random_sampled_train_set = torch.utils.data.RandomSampler(dataset, 
+                                                                replacement=False, 
+                                                                num_samples=num_train_samples, 
+                                                                generator=None)
+print("Lenght of subset dataset:", len(random_sampled_train_set))
+loader = DataLoader(dataset,
+                    sampler=random_sampled_train_set,
+                    batch_size = batch_size, shuffle= False, drop_last=True)
+
+#%% Loading celebA dataset
+# Checking the loaded data
+print(len(loader))
+examples = iter(loader)
+samples, _ = examples.next()
+print(samples.shape)
+#%%  # function to show an image
+
+
+
+def imshow(img, title):
+    img = img / 2 + 0.5     # unnormalize
+    npimg = img.cpu().numpy()
+    plt.title(title)
+    plt.imshow(np.transpose(npimg, (1, 2, 0)))
+    plt.show()
+    
+
+
+# get some random training images
+dataiter = iter(loader)
+images, labels = dataiter.next()
+
+# show images
+imshow(torchvision.utils.make_grid(images[:32], normalize=False), title="real images")
+# print labels
+# print(' '.join(f'{classes[labels[j]]:5s}' for j in range(BATCH_SIZE)))
+#%%Visualizing the training dataset images
+# Visualizing the dataset images
+real_batch = next(iter(loader))
+plt.figure(figsize=(8,8))
+plt.axis("off")
+plt.title("Training Images")
+plt.imshow(np.transpose(torchvision.utils.make_grid(real_batch[0].to(device)[:8], padding=2, normalize=True).cpu(),(1,2,0)))
+plt.show()
+#%%Creating Critic Class of WGAN
+# Creating Critic Class
+class Critic(nn.Module):
+    def __init__(self, channel_img, feature_d):
+        super().__init__()
+        self.disc = nn.Sequential(
+            nn.Conv2d(channel_img, feature_d, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            self._block(feature_d, feature_d*2, 4, 2, 1),
+            self._block(feature_d*2, feature_d*4, 4, 2, 1),
+            self._block(feature_d*4, feature_d*8, 4, 2, 1),
+            nn.Conv2d(feature_d*8, 1, 4, 2, 0),
+        )
+       
+    def _block(self, in_channels, out_channels, kernel_size, stride, padding):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False),
+            nn.InstanceNorm2d(out_channels, affine = True),
+            nn.LeakyReLU(0.2),
+        )
+    
+    def forward(self, x):
+        return self.disc(x)
+
+#%%Creating Generator Class
+# Creating Generator Class
+class Generator(nn.Module):
+    def __init__(self, z_dim, channel_img, feature_g):
+        super().__init__()
+        self.gen = nn.Sequential(
+            self._block(z_dim, feature_g*16, 4, 2, 0),
+            self._block(feature_g*16, feature_g*8, 4, 2, 1),
+            self._block(feature_g*8, feature_g*4, 4, 2, 1),
+            self._block(feature_g*4, feature_g*2, 4, 2, 1),
+            nn.ConvTranspose2d(feature_g*2, channel_img,4, 2, 1),
+            nn.Tanh(),
+        )
+        
+    def _block(self, in_channels, out_channels, kernel_size, stride, padding):
+        return nn.Sequential(
+            nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
+        )
+    
+    def forward(self, x):
+        return self.gen(x)
+
+#%%Initializing the weights¶
+# Function to initialize the model weights
+def initialize_weights(model):
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d):
+            nn.init.normal_(m.weight.data, 0.0, 0.02)    # mean = 0, variance = 0.02
+        if isinstance(m, nn.ConvTranspose2d):
+            nn.init.normal_(m.weight.data, 0.0, 0.02)
+        if isinstance(m, nn.BatchNorm2d):
+            nn.init.normal_(m.weight.data, 0.0,0.02)
+#%%Defining gradient penalty
+def gradient_penalty(critic, real, fake, device = 'cpu'):
+    batch_size, C, H, W = real.shape
+    epsilon = torch.rand(batch_size,1,1,1).repeat(1,C,H,W).to(device)
+    interpolated_images = real*epsilon + fake*(1-epsilon)
+    
+    # Calculate critic scores
+    mixed_scores = critic(interpolated_images)
+    
+    gradient = torch.autograd.grad(
+        inputs = interpolated_images,
+        outputs = mixed_scores,
+        grad_outputs = torch.ones_like(mixed_scores),
+        create_graph = True,
+        retain_graph = True,
+    )[0]
+    
+    gradient = gradient.view(gradient.shape[0], -1)
+    gradient_norm = gradient.norm(2, dim = 1)
+    gradient_penalty = torch.mean((gradient_norm - 1)**2)
+    return gradient_penalty
+
+#%%Creating model instance¶
+# Creating model objects
+critic = Critic(channel_img, feature_d).to(device)
+gen = Generator(z_dim, channel_img, feature_g).to(device)
+initialize_weights(critic)
+initialize_weights(gen)
+
+#%% optimizer and the loss function
+# Defining optimizer and loss functions
+opt_critic = optim.Adam(critic.parameters(), lr = learning_rate, betas=(0.0, 0.9))
+opt_gen = optim.Adam(gen.parameters(), lr= learning_rate, betas=(0.0,0.9))
+
+#%%# telling the model that the data is for training
+gen.train()
+critic.train()
+
+#%%Training Loop for initial 3 epochs
+# Traning Loop
+img_list = []
+step = 0
+
+for epoch in range(num_epochs):
+    for batch_idx, (real, _) in enumerate(loader):
+        real = real.to(device)
+
+        
+        for _ in range(critic_iterations):
+            noise = torch.randn(batch_size, z_dim, 1, 1).to(device)
+            fake = gen(noise)                                                 # G(z)
+            critic_real = critic(real).reshape(-1)
+            critic_fake = critic(fake).reshape(-1)
+            gp = gradient_penalty(critic, real, fake, device = device)
+            loss_critic = -(torch.mean(critic_real) - torch.mean(critic_fake)) + lambda_GP*gp
+            #loss_crit.append(loss_critic)
+            critic.zero_grad()
+            loss_critic.backward(retain_graph = True)
+            opt_critic.step()
+            
+        # Training Generator : -min E(critic(fgen_fake))
+        output = critic(fake).reshape(-1)
+        loss_gen = -torch.mean(output)
+        #loss_generator.append(loss_gen)
+        gen.zero_grad()
+        loss_gen.backward()
+        opt_gen.step()
+        
+        
+        # Printing
+        if batch_idx % 100 ==0:
+            print(f"Epoch [{epoch+1}/{num_epochs}] Batch : {batch_idx}/{len(loader)} \
+            LossD: {loss_critic:.4f}, LossG: {loss_gen:.4f}"
+                 )
+
+        step += 1
+    imshow(torchvision.utils.make_grid(fake[:32], normalize=False), title="fake images,  epoch=%i"%(epoch),)
+
+#%%Saving the Critic and Generator model
+# Print model's state_dict
+print("Model's state_dict:")
+for param_tensor in critic.state_dict():
+    #print(param_tensor, "\t", critic.state_dict()[param_tensor].size())
+    pass
+
+# Print optimizer's state_dict
+print("Optimizer's state_dict:")
+for var_name in opt_critic.state_dict():
+    #print(var_name, "\t", opt_critic.state_dict()[var_name])
+    pass
+    
+#torch.save(critic.state_dict(), "model_trained.h5")
+torch.save(critic.state_dict(), "Critic_trained.h5")
+
+#%%# Print model's state_dict
+print("Model's state_dict:")
+for param_tensor in gen.state_dict():
+    #print(param_tensor, "\t", critic.state_dict()[param_tensor].size())
+    pass
+
+# Print optimizer's state_dict
+print("Optimizer's state_dict:")
+for var_name in opt_gen.state_dict():
+    #print(var_name, "\t", opt_critic.state_dict()[var_name])
+    pass
+
+torch.save(gen.state_dict(), "Generator_trained.h5")
+
+#%%Loading the models till 3 epochs¶
+gen_1 = Generator(z_dim, channel_img, feature_g).to(device)
+gen_1.load_state_dict(torch.load('./Generator_trained.h5', map_location='cuda:6'))
+gen_1.to(device)#cuda()
+
+#%%Visualizing images till 3 epochs
+img_list = []
+fixed_noise = torch.randn(32, z_dim, 1, 1).to(device)
+with torch.no_grad():
+    fake = gen_1(fixed_noise).detach().cpu()
+img_list.append(torchvision.utils.make_grid(fake, padding=2, normalize=True))
+fig = plt.figure(figsize=(8,8))
+plt.axis("off")
+ims = [[plt.imshow(np.transpose(i,(1,2,0)), animated=True)] for i in img_list]
+
+#%%Loading the critic and generator model trained till 7th epoch
+critic_1 = Critic(channel_img, feature_d).to(device)
+critic_1.load_state_dict(torch.load('./Critic_trained.h5', map_location='cuda:6'))
+critic_1.to(device)
+
+#%%gen_1 = Generator(z_dim, channel_img, feature_g).to(device)
+gen_1.load_state_dict(torch.load('./Generator_trained.h5', map_location='cuda:6'))
+gen_1.to(device)
+
+#%%Continuing the training
+# Defining optimizer and loss functions
+opt_critic = optim.Adam(critic_1.parameters(), lr = learning_rate, betas=(0.0, 0.9))
+opt_gen = optim.Adam(gen_1.parameters(), lr= learning_rate, betas=(0.0,0.9))
+gen_1.train()
+critic_1.train()
+
+#%%# Traning Loop
+img_list = []
+step = 0
+num_epcohs = 80
+
+for epoch in range(num_epochs):
+    for batch_idx, (real, _) in enumerate(loader):
+        real = real.to(device)
+
+        
+        for _ in range(critic_iterations):
+            noise = torch.randn(batch_size, z_dim, 1, 1).to(device)
+            fake = gen_1(noise)                                                 # G(z)
+            critic_real = critic_1(real).reshape(-1)
+            critic_fake = critic_1(fake).reshape(-1)
+            gp = gradient_penalty(critic_1, real, fake, device = device)
+            loss_critic = -(torch.mean(critic_real) - torch.mean(critic_fake)) + lambda_GP*gp
+            #loss_crit.append(loss_critic)
+            critic_1.zero_grad()
+            loss_critic.backward(retain_graph = True)
+            opt_critic.step()
+            
+        # Training Generator : -min E(critic(fgen_fake))
+        output = critic_1(fake).reshape(-1)
+        loss_gen = -torch.mean(output)
+        #loss_generator.append(loss_gen)
+        gen_1.zero_grad()
+        loss_gen.backward()
+        opt_gen.step()
+        
+        # Printing
+        if batch_idx % 100 ==0:
+            print(f"Epoch [{epoch+7}/{num_epochs}] Batch : {batch_idx}/{len(loader)} \
+            LossD: {loss_critic:.4f}, LossG: {loss_gen:.4f}"
+                 )
+        
+        if num_epcohs == 90:
+            #torch.save(critic.state_dict(), "model_trained.h5")
+            torch.save(critic_1.state_dict(), "Critic_Final_trained.h5")
+            torch.save(gen_1.state_dict(), "Generator_Final_trained.h5")
+            
+        
+#         if (step % 500 == 0) or ((epoch == num_epochs-1) and (i == len(loader)-1)):
+#             with torch.no_grad():
+#                 fake = gen(fixed_noise).detach().cpu()
+#             img_list.append(torchvision.utils.make_grid(fake, padding=2, normalize=True))
+        imshow(torchvision.utils.make_grid(fake[:32], normalize=False), title="fake images,  epoch=%i"%(epoch),)
+        # print("flag2")   
+        step += 1
+        
+
+        
+#%%Finally saving the parameters¶
+torch.save(critic_1.state_dict(), "Critic_Final_trained.h5")
+torch.save(gen_1.state_dict(), "Generator_Final_trained.h5")
+gen_2 = Generator(z_dim, channel_img, feature_g).to(device)
+gen_2.load_state_dict(torch.load('./Generator_Final_trained.h5', map_location='cuda:6'))
+gen_2.to(device)
+
+#%%Images generator after 8 epochs¶
+img_list = []
+fixed_noise = torch.randn(32, z_dim, 1, 1).to(device)
+with torch.no_grad():
+    fake = gen_2(fixed_noise).detach().cpu()
+img_list.append(torchvision.utils.make_grid(fake, padding=2, normalize=True))
+fig = plt.figure(figsize=(8,8))
+plt.axis("off")
+ims = [[plt.imshow(np.transpose(i,(1,2,0)), animated=True)] for i in img_list]
+plt.title('Generated Fake Images')
+
+#%%
+
